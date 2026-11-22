@@ -1,0 +1,201 @@
+eSim 2.5 on Ubuntu 25.04
+Troubleshooting code and commands
+
+Tested on Ubuntu 25.04 amd64 in Docker. Run the commands in a disposable
+Ubuntu 25.04 environment as a regular user with sudo access for installation.
+The code excerpts are from Git commit 174e052. Path variables below let the
+same commands work with a checkout and unpacked release in different locations.
+
+    checkout=/absolute/path/to/patched/eSim-checkout
+    release_dir=/absolute/path/to/unpacked/eSim-2.5
+    upstream=a77d6b904c7bab275d819cf4d8cbb594802fe16d
+
+The archive came from https://esim.fossee.in/downloads. From the directory
+containing the ZIP, check the release checksum before extracting it:
+
+    printf '%s  %s\n' \
+      b9860ae26f026930bae589520761f4a57b85d593a2e2cd1ac83d5e5db2f281ed \
+      eSim-2.5.zip | sha256sum -c -
+    unzip eSim-2.5.zip
+
+1. Published ZIP rejects Ubuntu 25.04
+-------------------------------------
+
+Reproduce with the unmodified ZIP:
+
+    cd "$release_dir"
+    bash install-eSim.sh --install
+    printf 'Exit status: %s\n' "$?"
+
+Observed: Unsupported Ubuntu version: 25.04 (), exit status 1.
+
+The published dispatcher had no 25.04 case. The replacement reads
+/etc/os-release and selects the worker that matches VERSION_ID:
+
+    . /etc/os-release
+
+    # This case arm is inside the dispatcher's case statement.
+    23.04|24.04|25.04)
+        installer=install-eSim-${VERSION_ID}.sh
+        ;;
+
+    script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    exec bash "$script_dir/install-eSim-scripts/$installer" "$1"
+
+Apply the fix by running the patched dispatcher from the unpacked ZIP:
+
+    cd "$release_dir"
+    bash "$checkout/Ubuntu/install-eSim.sh" --install
+
+The patched dispatcher reported "Detected OS: Ubuntu 25.04" and proceeded to
+the 25.04 worker. This command also applies the fixes in sections 3 and 4.
+
+Source file: Ubuntu/install-eSim.sh
+
+2. FOSSEE installers branch fails Bash parsing
+----------------------------------------------
+
+The branch already had a 25.04 case, but a truncated conditional and leftover
+installer code left the dispatcher syntactically invalid. To reproduce the
+original failure and check both patched scripts:
+
+    original=$(mktemp)
+    git -C "$checkout" show "$upstream:Ubuntu/install-eSim.sh" > "$original"
+    bash -n "$original"
+    printf 'Original syntax-check exit status: %s\n' "$?"
+    rm -- "$original"
+
+    bash -n "$checkout/Ubuntu/install-eSim.sh"
+    bash -n "$checkout/Ubuntu/install-eSim-scripts/install-eSim-25.04.sh"
+
+Observed: the original syntax check exited 2 near an unexpected "}".
+Both patched scripts passed. The replacement closes the dispatcher logic
+and uses the exec bash command in section 1 to forward the worker's exit status.
+
+Source files: Ubuntu/install-eSim.sh and
+              Ubuntu/install-eSim-scripts/install-eSim-25.04.sh
+
+3. HDLParse 1.0.4 fails with modern setuptools
+---------------------------------------------
+
+Reproduce in a separate virtual environment with Plucky's Python 3.13,
+python3-venv, python3-setuptools, and python3-wheel available:
+
+    legacy_env=$(mktemp -d)
+    /usr/bin/python3 -m venv --system-site-packages "$legacy_env"
+    "$legacy_env/bin/python" -m pip install --disable-pip-version-check \
+      --no-build-isolation --no-deps hdlparse==1.0.4
+    printf 'Exit status: %s\n' "$?"
+
+Observed: "error in hdlparse setup command: use_2to3 is invalid." Exit status 1.
+
+The patched worker installs a commit-pinned HDLParse revision that builds
+as 1.0.7. It uses Ubuntu's PyQt5 and scientific packages from the virtual
+environment. These are the commands the patched worker runs:
+
+    config_dir="$HOME/.esim"
+    hdlparse_url=https://codeload.github.com/hdl/pyHDLParser/tar.gz/e1153ace8ca1e25f9fb53350c41058ef8eb8dacf
+    mkdir -p -- "$config_dir"
+    /usr/bin/python3 -m venv --system-site-packages "$config_dir/env"
+    "$config_dir/env/bin/python" -m pip install \
+      --no-build-isolation --no-deps "$hdlparse_url"
+
+Check the imports using the installed eSim environment:
+
+    "$HOME/.esim/env/bin/python" -c '
+    from PyQt5 import QtCore, QtWidgets
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+    import hdlparse.verilog_parser, psutil, watchdog
+    print("eSim Python dependencies import successfully")
+    '
+
+Source file: Ubuntu/install-eSim-scripts/install-eSim-25.04.sh
+
+4. The old installer exits early when KiCad 8 is already present
+----------------------------------------------------------------
+
+With Ubuntu's KiCad 8 APT package already installed, an isolated run of the
+original installKicad function printed "KiCad 8.0 is already installed."
+and ended the Bash process with status 0. The rest of the installer was
+skipped. Check the APT package and executable versions first:
+
+    dpkg-query -W -f='${Version}\n' kicad
+    kicad-cli version
+
+Read the original function to see the exit:
+
+    git -C "$checkout" show \
+      "$upstream:Ubuntu/install-eSim-scripts/install-eSim-25.04.sh" |
+      sed -n '/^function installKicad$/,/^}/p'
+
+The patched worker asks APT to satisfy the package list and continues
+through Python dependencies and launchers when KiCad is already present:
+
+    sudo apt-get -o APT::Update::Error-Mode=any update
+    sudo apt-get install -y --no-install-recommends \
+        ca-certificates kicad kicad-footprints kicad-symbols kicad-templates \
+        ngspice python3-venv python3-setuptools python3-wheel python3-pyqt5 \
+        python3-matplotlib python3-psutil python3-watchdog xterm xz-utils
+
+It calls the Python symbol registrar with the KiCad configuration
+directory derived from kicad-cli version. The registrar skips existing
+symbol names:
+
+    row_names = set(re.findall(r'\(lib\s*\(name\s+"([^"]+)"\)', content))
+    for symbol in sorted(bundled_dir.glob("eSim_*.kicad_sym")):
+        if symbol.stem in row_names:
+            continue
+
+After the first successful install, run it again and check that the symbol
+table is byte-for-byte identical. KiCad 8.0.8 used the 8.0 directory:
+
+    table="${XDG_CONFIG_HOME:-$HOME/.config}/kicad/8.0/sym-lib-table"
+    checksum=$(mktemp)
+    sha256sum "$table" > "$checksum"
+    cd "$release_dir"
+    bash "$checkout/Ubuntu/install-eSim.sh" --install && sha256sum -c "$checksum"
+    rm -- "$checksum"
+
+Observed: the reinstall reached Python dependency verification and finished.
+The KiCad symbol table checksum check returned OK.
+
+Source files: Ubuntu/install-eSim-scripts/install-eSim-25.04.sh and
+              Ubuntu/install-eSim-scripts/register-plucky-symbols.py
+
+5. Run the post-install smoke test
+----------------------------------
+
+    QT_QPA_PLATFORM=offscreen "$HOME/.esim/env/bin/python" \
+      "$checkout/Ubuntu/tests/smoke-esim-25.04.py" "$release_dir"
+
+Observed: eSim 2.5 main window opened. KiCad 8.0.8 exported its packaged
+Arduino Uno template. ngspice measured 5.000 V in a 10 V resistor divider.
+
+Source file: Ubuntu/tests/smoke-esim-25.04.py
+
+Open issues recorded during troubleshooting
+-------------------------------------------
+
+The bundled NGHDL dispatcher still rejects Ubuntu 25.04 before it reaches
+LLVM. These commands reproduced the early exit and checked Ubuntu’s
+LLVM and GHDL package candidates:
+
+    nghdl_dir=$(mktemp -d)
+    unzip -q "$release_dir/nghdl.zip" -d "$nghdl_dir"
+    (cd "$nghdl_dir/nghdl" && bash install-nghdl.sh --install)
+    apt-cache policy ghdl-llvm llvm-19 llvm-20
+
+Legacy RC netlist export also failed. Reproduce with:
+
+    export_dir=$(mktemp -d)
+    kicad-cli sch export netlist -o "$export_dir/rc.net" \
+      "$release_dir/Examples/RC/RC.sch"
+
+The repaired installer covers the main GUI and analog tools.
+
+To see the complete code changes rather than the excerpts:
+
+    git -C "$checkout" show --stat 174e052
+    git -C "$checkout" show 174e052
+
+The full Git patch is alongside this file as esim-plucky-installer.patch.
